@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import html
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -67,7 +68,7 @@ LIM_FAIL_IP = [(20, 3600)]                # IP 単位のログイン失敗
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
        "te", "trailers", "transfer-encoding", "upgrade", "host"}
 DROP = {"cdn-loop", GATE_HEADER.lower(), CLIENT_IP_HEADER.lower(), "x-auth-email",
-        "x-forwarded-for", "x-real-ip", "forwarded"}
+        "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip", "forwarded"}
 EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
 
 
@@ -431,6 +432,17 @@ class Handler(BaseHTTPRequestHandler):
         ip = (h.get(CLIENT_IP_HEADER) if h else "") or "-"
         return re.sub(r"[^0-9A-Fa-f:.]", "", ip)[:45] or "-"
 
+    def rate_key(self):
+        """レート制限のキー。IPv6 は 1 人が /64 単位で大量のアドレスを持てるため /64 にまとめる"""
+        ip = self.client_ip()
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return ip
+        if a.version == 6 and a.ipv4_mapped is None:
+            return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+        return ip
+
     # ---------- helpers
     def cookies(self):
         out = {}
@@ -527,6 +539,7 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- auth
     def auth_route(self, path):
         ip = self.client_ip()
+        rk = self.rate_key()
         q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query))
 
         if path == "/__auth/login" and self.command in ("GET", "HEAD"):
@@ -535,7 +548,7 @@ class Handler(BaseHTTPRequestHandler):
         # Google へリダイレクト (state / nonce / PKCE を発行)
         if path == "/__auth/google" and self.command in ("GET", "HEAD"):
             next_ = safe_next(q.get("next", "/"))
-            if not LIMIT.check(f"start-ip:{ip}", LIM_START_IP):
+            if not LIMIT.check(f"start-ip:{rk}", LIM_START_IP):
                 return self.send(429, page_login(next_, "ログイン試行が多すぎます。しばらく待ってから再度お試しください。"))
             state, nonce, verifier = (secrets.token_urlsafe(32) for _ in range(3))
             bind = secrets.token_urlsafe(32)   # state をこのブラウザに結び付ける (ログイン CSRF 対策)
@@ -554,7 +567,7 @@ class Handler(BaseHTTPRequestHandler):
         # Google からの戻り
         if path == CALLBACK_PATH and self.command in ("GET", "HEAD"):
             clear = [self.set_cookie(OAUTH_COOKIE, "", 0)]
-            if not LIMIT.check(f"fail-ip:{ip}", LIM_FAIL_IP, record=False):
+            if not LIMIT.check(f"fail-ip:{rk}", LIM_FAIL_IP, record=False):
                 return self.send(429, page_login("/", "ログイン失敗が多すぎます。しばらく待ってから再度お試しください。"), headers=clear)
             state = q.get("state", "")[:100]
             with PENDING_LOCK:
@@ -562,7 +575,7 @@ class Handler(BaseHTTPRequestHandler):
             bind = self.cookies().get(OAUTH_COOKIE, "")[:100]
             if not p or p["exp"] < time.time() or \
                not hmac.compare_digest(p["bind"], hashlib.sha256(bind.encode()).hexdigest()):
-                LIMIT.add(f"fail-ip:{ip}")
+                LIMIT.add(f"fail-ip:{rk}")
                 return self.send(400, page_login("/", "ログインの有効期限が切れました。もう一度お試しください。"), headers=clear)
             if q.get("error") or not q.get("code"):
                 log(f"oauth canceled/error {q.get('error', '')[:50]!r} (ip {ip})")
@@ -570,11 +583,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 email = google_exchange(q["code"][:2048], p["verifier"], p["nonce"])
             except ValueError as e:
-                LIMIT.add(f"fail-ip:{ip}")
+                LIMIT.add(f"fail-ip:{rk}")
                 log(f"oauth FAILED: {e} (ip {ip})")
                 return self.send(400, page_login(p["next"], "ログインに失敗しました。もう一度お試しください。"), headers=clear)
             if not ALLOW.allowed(email):
-                LIMIT.add(f"fail-ip:{ip}")
+                LIMIT.add(f"fail-ip:{rk}")
                 log(f"login DENIED {email} (not in allowlist, ip {ip})")
                 return self.send(403, page_login(p["next"],
                                  f"{email} はアクセスを許可されていません。別のアカウントでお試しください。"), headers=clear)
@@ -610,6 +623,9 @@ class Handler(BaseHTTPRequestHandler):
         fwd["Host"] = ORIGIN.netloc
         fwd["X-Auth-Email"] = email
         fwd["X-Forwarded-For"] = self.client_ip()
+        # 利用者が送った X-Forwarded-Host 等は使わず公開 URL から設定 (内部アプリが URL 生成に使うため)
+        fwd["X-Forwarded-Host"] = urllib.parse.urlsplit(PUBLIC_ORIGIN).netloc
+        fwd["X-Forwarded-Proto"] = "https"
         return fwd
 
     def proxy(self, email):
@@ -644,8 +660,11 @@ class Handler(BaseHTTPRequestHandler):
                     has_len = True
                 if lk == "cache-control":
                     has_cc, v = True, private_cache(v)
-                if lk == "location" and v.startswith(ORIGIN_BASE):
-                    v = v[len(ORIGIN_BASE):] or "/"
+                if lk == "set-cookie" and v.split("=", 1)[0].strip().startswith(COOKIE_PREFIX):
+                    continue   # 内部アプリがゲートのセッション Cookie を上書き (セッション固定) できないように
+                if lk == "location" and (v == ORIGIN_BASE or
+                                         (v.startswith(ORIGIN_BASE) and v[len(ORIGIN_BASE)] in "/?#")):
+                    v = v[len(ORIGIN_BASE):] or "/"   # "http://app.example.evil" のような別ホストは書き換えない
                 self.send_header(k, v)
             if not has_cc:
                 self.send_header("Cache-Control", "private")

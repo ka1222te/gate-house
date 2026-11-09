@@ -9,6 +9,7 @@
 """
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -153,7 +154,6 @@ def cmd_set_tunnel(cfg, url):
     secret = os.environ.get("GATE_SECRET")
     if not secret:
         sys.exit("[x] GATE_SECRET が未設定です。")
-    import re
     if not re.fullmatch(r"https://[a-z0-9-]+\.trycloudflare\.com", url):
         sys.exit(f"[x] 不正なトンネル URL: {url!r}")
     put_tunnel(CF(cfg), cfg, {"url": url, "secret": secret})
@@ -165,14 +165,22 @@ def cmd_clear_tunnel(cfg):
     print("[+] Worker をメンテナンス表示に切替")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None   # リダイレクト先に X-Gate-Secret を送らない (3xx は HTTPError として扱う)
+
+
 def cmd_wait_ready(url, timeout=90):
     secret = os.environ.get("GATE_SECRET", "")
+    if not re.fullmatch(r"https://[a-z0-9-]+\.trycloudflare\.com", url):
+        sys.exit(f"[x] 不正なトンネル URL: {url!r}")
+    opener = urllib.request.build_opener(_NoRedirect)
     end = time.time() + timeout
     last = None
     while time.time() < end:
         try:
             r = urllib.request.Request(url, method="HEAD", headers={"X-Gate-Secret": secret})
-            with urllib.request.urlopen(r, timeout=10) as res:
+            with opener.open(r, timeout=10) as res:
                 code = res.status
         except urllib.error.HTTPError as e:
             code = e.code

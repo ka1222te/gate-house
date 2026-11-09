@@ -35,7 +35,7 @@ rotate "$STATE/gatekeeper.log"
 [[ -f $STATE/cloudflared.log ]] && mv -f "$STATE/cloudflared.log" "$STATE/cloudflared.log.1"
 
 # 起動ごとに新しい共有シークレット
-GATE_SECRET=$(python3 -c 'import secrets;print(secrets.token_urlsafe(48))')
+GATE_SECRET=$(python3 -I -c 'import secrets;print(secrets.token_urlsafe(48))')
 export GATE_SECRET
 
 # 失敗時は起動したものを止める
@@ -68,6 +68,6 @@ python3 -I lib/cf.py wait-ready "$URL"
 python3 -I lib/cf.py set-tunnel "$URL"
 trap - ERR
 
-HOST=$(python3 -c 'import json;print(json.load(open(".state/cloudflare.json"))["host"])')
+HOST=$(python3 -I -c 'import json;print(json.load(open(".state/cloudflare.json"))["host"])')
 echo
 echo "公開URL: https://$HOST/"
