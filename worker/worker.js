@@ -23,7 +23,14 @@ export default {
     if (upstream.protocol !== "https:" || !upstream.hostname.endsWith(".trycloudflare.com")) {
       return page(500, "設定エラー", "転送先の設定が不正です。");
     }
-    const target = new URL(inUrl.pathname + inUrl.search, upstream);
+    // new URL(path, base) だと "//evil.example/..." がプロトコル相対 URL として別ホストに解決され、
+    // 秘密ヘッダと Cookie が第三者に送られてしまう。転送先のオリジンを固定してパスだけ差し替える
+    const target = new URL(upstream.origin);
+    target.pathname = inUrl.pathname;
+    target.search = inUrl.search;
+    if (target.origin !== upstream.origin) {
+      return new Response("Bad Request", { status: 400 });
+    }
 
     const headers = new Headers(req.headers);
     headers.set("X-Gate-Secret", cfg.secret);

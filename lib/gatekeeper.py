@@ -467,7 +467,11 @@ class Handler(BaseHTTPRequestHandler):
         if "chunked" in te:
             chunks, total = [], 0
             while True:
-                size = int(self.rfile.readline(100).split(b";")[0].strip() or b"0", 16)
+                # 負の値 ("-1") や "0x10" を受け付けると read(-1) で上限なしに読み込むため 16 進数字のみ許可
+                tok = self.rfile.readline(100).split(b";")[0].strip()
+                if not re.fullmatch(rb"[0-9A-Fa-f]{1,8}", tok):
+                    raise ValueError("bad chunk size")
+                size = int(tok, 16)
                 if size == 0:
                     while self.rfile.readline(8192) not in (b"\r\n", b"\n", b""):
                         pass
@@ -478,8 +482,11 @@ class Handler(BaseHTTPRequestHandler):
                 chunks.append(self.rfile.read(size))
                 self.rfile.readline(100)
             return b"".join(chunks)
-        n = int(self.headers.get("Content-Length") or 0)
-        if n < 0 or n > limit:
+        cl = (self.headers.get("Content-Length") or "0").strip()
+        if not re.fullmatch(r"[0-9]{1,12}", cl):   # int() が通す "+5" "1_0" 等は不可
+            raise ValueError("bad content-length")
+        n = int(cl)
+        if n > limit:
             raise ValueError("body too large")
         return self.rfile.read(n) if n else None
 
@@ -591,7 +598,9 @@ class Handler(BaseHTTPRequestHandler):
         """中継先へ送るヘッダ (hop-by-hop・認証用ヘッダ・ゲートの Cookie を除く)"""
         fwd = {}
         for k, v in self.headers.items():
-            lk = k.lower()
+            # "X-Auth_Email" のような _ 入りの名前は、WSGI/CGI 系のサーバで "X-Auth-Email" と
+            # 同一視されることがあるため、- に揃えてから判定する (X-Auth-Email 等の偽装対策)
+            lk = k.lower().replace("_", "-")
             if lk in HOP or lk in DROP or lk.startswith("cf-") or lk == "cookie":
                 continue
             fwd[k] = v
