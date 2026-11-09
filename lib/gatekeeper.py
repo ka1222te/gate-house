@@ -55,6 +55,8 @@ GOOGLE_ISSUERS = ("https://accounts.google.com", "accounts.google.com")
 OAUTH_TTL = 600             # Google でのログイン操作の有効期限 (秒)
 MAX_PENDING = 5000          # 未完了ログインの上限 (メモリ保護)
 MAX_BODY = 20 * 1024 * 1024 # プロキシするリクエストボディ上限
+BUFFER_MAX = 4 * 1024 * 1024  # これ以下の応答は読み切ってから長さ付きで送る (メモリ使用量の上限)
+LENGTH_HEADER = "X-Gate-Length"   # 応答本文の長さ。Worker が照合して、途中で切れた本文を再取得する
 SOCKET_TIMEOUT = 60
 MAX_CONNECTIONS = 128      # 同時接続 (スレッド) 上限
 MAX_WEBSOCKETS = 64        # 同時 WebSocket 接続の上限 (通常の HTTP 用にスレッドを残す)
@@ -645,6 +647,9 @@ class Handler(BaseHTTPRequestHandler):
         fwd = self.forward_headers(email)
         if body is not None:
             fwd["Content-Length"] = str(len(body))
+        # 圧縮は Cloudflare がブラウザ向けに行うので、中継先からは非圧縮で受け取る
+        # (Worker が本文の長さを X-Gate-Length と照合できるようにするため)
+        fwd["Accept-Encoding"] = "identity"
 
         Conn = http.client.HTTPSConnection if ORIGIN.scheme == "https" else http.client.HTTPConnection
         conn = Conn(ORIGIN.netloc, timeout=120)
@@ -656,13 +661,36 @@ class Handler(BaseHTTPRequestHandler):
             log(f"origin error: {e!r}")
             return self.send(502, "Bad Gateway", "text/plain")
 
+        # 本文は BUFFER_MAX まで読み切ってから Content-Length と X-Gate-Length を付けて送る。
+        # トンネル経由で本文が途中で切れても Worker が検出して再取得できるようにするため
+        # (切れた本文が「正常」としてブラウザにキャッシュされ、JS が壊れる問題の対策)。
+        # それより大きい応答と SSE はこれまでどおり逐次転送する。
+        no_body = self.command == "HEAD" or res.status in (204, 304) or 100 <= res.status < 200
+        ctype = (res.getheader("Content-Type") or "").lower()
+        whole = head = None
+        if not no_body and not ctype.startswith("text/event-stream"):
+            try:
+                head = res.read(BUFFER_MAX + 1)
+            except (http.client.IncompleteRead, OSError) as e:
+                conn.close()
+                log(f"origin error (body): {e!r}")
+                return self.send(502, "Bad Gateway", "text/plain")
+            if len(head) <= BUFFER_MAX:
+                if res.length:   # Content-Length に満たないまま切断された (read(n) は例外を出さない)
+                    conn.close()
+                    log(f"origin error (body): truncated, {len(head)} bytes + {res.length} missing")
+                    return self.send(502, "Bad Gateway", "text/plain")
+                whole, head = head, None
+
         try:
             self.send_response(res.status, res.reason)
             has_len = has_cc = False
             for k, v in res.getheaders():
                 lk = k.lower()
-                if lk in HOP:
+                if lk in HOP or lk == LENGTH_HEADER.lower():
                     continue
+                if whole is not None and lk == "content-length":
+                    continue   # 下で実際の長さを付ける
                 if lk == "content-length":
                     has_len = True
                 if lk == "cache-control":
@@ -675,7 +703,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header(k, v)
             if not has_cc:
                 self.send_header("Cache-Control", "private")
-            no_body = self.command == "HEAD" or res.status in (204, 304) or 100 <= res.status < 200
+            if whole is not None:
+                self.send_header("Content-Length", str(len(whole)))
+                self.send_header(LENGTH_HEADER, str(len(whole)))
+                self.end_headers()
+                self.wfile.write(whole)
+                return
             chunked = not has_len and not no_body
             if chunked:
                 self.send_header("Transfer-Encoding", "chunked")
@@ -683,7 +716,7 @@ class Handler(BaseHTTPRequestHandler):
             if no_body:
                 return
             while True:
-                data = res.read1(65536)
+                data, head = (head, None) if head else (res.read1(65536), None)
                 if not data:
                     break
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data) if chunked else data)
