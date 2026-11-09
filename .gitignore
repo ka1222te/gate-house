@@ -1,0 +1,4 @@
+.env
+.state/
+allowed_emails.txt
+**.pyc
