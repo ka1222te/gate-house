@@ -1,4 +1,17 @@
+# 秘密情報 (.env のコピーやバックアップも含めて除外。ひな形だけ追跡)
 .env
+.env.*
+!.env.example
 .state/
-allowed_emails.txt
+allowed_emails*.txt
+
+# Python
+__pycache__/
 **.pyc
+
+# エディタのバックアップ・一時ファイル (中身が .env などのコピーになることがある)
+*~
+*.swp
+*.swo
+*.bak
+*.orig

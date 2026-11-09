@@ -485,8 +485,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("bad chunk size")
                 size = int(tok, 16)
                 if size == 0:
-                    while self.rfile.readline(8192) not in (b"\r\n", b"\n", b""):
-                        pass
+                    for _ in range(64):   # トレーラ行を無限に送られてスレッドを占有されないよう上限
+                        if self.rfile.readline(8192) in (b"\r\n", b"\n", b""):
+                            break
+                    else:
+                        raise ValueError("too many trailers")
                     break
                 total += size
                 if total > limit:
@@ -502,9 +505,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("body too large")
         return self.rfile.read(n) if n else None
 
-    def form(self):
-        raw = self._read_body(8192) or b""
-        return {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode(errors="replace")).items()}
+    def has_body(self):
+        return self.headers.get("Content-Length", "0").strip() != "0" or bool(self.headers.get("Transfer-Encoding"))
 
     def set_cookie(self, name, value, max_age):
         return ("Set-Cookie", f"{name}={value}; Path=/; Max-Age={max_age}; Secure; HttpOnly; SameSite=Lax")
@@ -515,16 +517,22 @@ class Handler(BaseHTTPRequestHandler):
         if not hmac.compare_digest(got, self.SECRET):
             self.close_connection = True
             return self.send(403, "Forbidden", "text/plain")
-        if not self.path.startswith("/"):
+        if not self.path.startswith("/") or re.search(r"[\x00-\x20\x7f-\xff]", self.path):
+            self.close_connection = True
             return self.send(400, "Bad Request", "text/plain")
 
         path = urllib.parse.urlsplit(self.path).path
         try:
             if path.startswith(AUTH_PREFIX):
+                # 認証用 URL はボディを使わない。読み残したボディが同じ接続の次のリクエストとして
+                # 解釈される (cloudflared は接続を他の利用者と共用する) のを防ぐため、読まずに切断
+                # (ログアウトの POST もボディ不要。ゆっくり送るボディでスレッドを占有されることも防ぐ)
+                if self.has_body():
+                    self.close_connection = True
                 return self.auth_route(path)
             email = SESSIONS.check(self.cookies().get(SESSION_COOKIE, ""))
             if not email:
-                if self.headers.get("Content-Length", "0") != "0" or self.headers.get("Transfer-Encoding"):
+                if self.has_body():
                     self.close_connection = True   # 未認証のボディは読まずに切断
                 if self.command == "GET" and "text/html" in self.headers.get("Accept", ""):
                     return self.redirect("/__auth/login?next=" + urllib.parse.quote(self.path, safe=""))
@@ -599,7 +607,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/__auth/logout":
             if self.command == "POST":   # GET でのログアウトは CSRF で強制ログアウトされうるため確認画面
-                self.form()
                 SESSIONS.revoke(self.cookies().get(SESSION_COOKIE))
                 return self.redirect("/__auth/login", [self.set_cookie(SESSION_COOKIE, "", 0)])
             return self.send(200, page_logout())
@@ -693,7 +700,7 @@ class Handler(BaseHTTPRequestHandler):
     def websocket(self, email):
         """WebSocket のハンドシェイクを中継し、以後は双方向にバイト列をそのまま転送する"""
         self.close_connection = True
-        if self.command != "GET" or self.headers.get("Content-Length", "0") != "0":
+        if self.command != "GET" or self.has_body():
             return self.send(400, "Bad Request", "text/plain")
         # Cross-Site WebSocket Hijacking 対策: ブラウザが付ける Origin は公開 URL のみ許可
         origin_hdr = self.headers.get("Origin")
