@@ -90,6 +90,44 @@ Worker の転送先を書き換えます。利用者からは常に同じ worker
      （正確な値は `./scripts/setup.sh` の最後に表示されます。あとから追加しても構いません）
 4. 表示された **クライアント ID** と **クライアント シークレット** を控える
 
+### 2.4 cloudflared のインストール
+
+gatekeeper を動かすサーバに `cloudflared` を入れます。Quick Tunnel を使うので、
+`cloudflared tunnel login` などのログインやトンネルの作成は**不要**です。
+
+**方法 A: バイナリを置く（sudo 不要）**
+
+```bash
+mkdir -p ~/.local/bin
+# x86_64 の場合。ARM64 は cloudflared-linux-arm64 に置き換える（`uname -m` で確認）
+curl -fL -o ~/.local/bin/cloudflared \
+  https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+chmod +x ~/.local/bin/cloudflared
+~/.local/bin/cloudflared --version
+```
+
+更新するときは同じコマンドをもう一度実行します（停止中に行ってください）。
+
+**方法 B: apt でインストール（Debian / Ubuntu、sudo が必要）**
+
+```bash
+sudo mkdir -p --mode=0755 /usr/share/keyrings
+curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg \
+  | sudo tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
+echo 'deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+  | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt-get update && sudo apt-get install -y cloudflared
+cloudflared --version
+```
+
+以後は `sudo apt-get upgrade` で更新されます。
+
+スクリプトは `.env` の `CLOUDFLARED` → `PATH` → `~/.local/bin` → `/usr/local/bin` → `/usr/bin` の順に
+`cloudflared` を探します。これ以外の場所に置いた場合は `.env` に `CLOUDFLARED='/path/to/cloudflared'` を追加してください。
+
+> `~/.cloudflared/config.yml` があると Quick Tunnel が起動しません。
+> 以前に名前付きトンネルを使っていた場合は、そのファイルを別名に退避してください。
+
 ---
 
 ## 3. セットアップ
@@ -280,7 +318,7 @@ Cloudflare API に繋がらない状況でプロセスだけ止めたいとき�
 
 | 症状 | 原因と対処 |
 |---|---|
-| `cloudflared が見つかりません` | `.env` に `CLOUDFLARED='/path/to/cloudflared'` を追加 |
+| `cloudflared が見つかりません` | 2.4 の手順でインストール。標準以外の場所に置いた場合は `.env` に `CLOUDFLARED='/path/to/cloudflared'` を追加 |
 | `workers.dev サブドメインが未登録です` | 2.1 の手順でサブドメインを登録 |
 | `API ... HTTP 403` / `Authentication error` | API トークンの権限（Workers Scripts : Edit）とアカウント ID を確認 |
 | `~/.cloudflared/config.yml があると…` | Quick Tunnel と競合するため、そのファイルを別名に退避 |
